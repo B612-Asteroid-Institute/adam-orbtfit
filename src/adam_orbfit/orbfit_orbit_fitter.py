@@ -21,23 +21,27 @@ from dateutil import parser as date_parser
 
 logger = logging.getLogger(__name__)
 
-STANDARD_OPTIONS = """! Input file for neocp run
+# Format string for the options file. Keeping some options not seen to change in
+# Orbfit unittests as constants
+OPTIONS = """! Input file for neocp run
 neocp.
-       .ons_name=.T.                ! NEOCP or provisional/number designation
-       .obsdir='mpcobs'             ! directory \of observations
-       .error_model='gaiaDR2_mix'   ! error model file name
-       .precob=.FALSE.              ! Precedence of rwo file
-       .background=.FALSE.           ! Only on\e grid
-       .neocp=.FALSE.               ! No variant orbits
-       .t_std= 59800.0            ! Standard epoch
-       .tno= .F.            ! TNO 
+       .ons_name=.T.                 ! NEOCP or provisional/number designation
+       .obsdir='{obsdir}'            ! directory of observations
+       .error_model='{error_model}'  ! error model file name
+       .precob=.FALSE.               ! Precedence of rwo file
+       .background=.FALSE.           ! Only one grid
+       .neocp=.{variants}.           ! No variant orbits
+       .t_std={epoch}                ! Standard epoch
+       .tno=.{tno}.                  ! TNO 
+       .satellite=.{nat_sat}.        ! Nat sat
+       .planet={planet}
 propag.
-       .iast=0                    ! 0=no asteroids with mass n=no. of massive asteroids
-       .filbe=' '              ! massive asteroids file
-       .ephem_file='JPLDE431'      ! ephemerides file
-       .npoint=600                 ! minimum number of data points for a deep close appr
-       .dmea=0.2d0                 ! min. distance for control close-app. to Earth only
-       .dter=0.05d0                ! min. distance for control close-app. to M, V, M
+       .iast={massive_count}         ! 0=no asteroids with mass n=no. of massive asteroids
+       .filbe='{massive_file}'       ! massive asteroids file
+       .ephem_file='{ephem}'         ! ephemerides file
+       .npoint=600                   ! minimum number of data points for a deep close appr
+       .dmea=0.2d0                   ! min. distance for control close-app. to Earth only
+       .dter=0.05d0                  ! min. distance for control close-app. to M, V, M
 reject.
        .rejopp = .F.    ! reject entire oppositions
        .rej_fudge= .F.  ! fudge not used
@@ -49,15 +53,74 @@ IERS.
 class OrbfitOrbitFitter(OrbitFitter):
     """Implementation of OrbitFitter using Orbfit."""
 
-    def __init__(self, work_dir: str):
+    def __init__(
+        self,
+        work_dir: str,
+        docker_image: str = "minorplanetcenter/orbfit:latest",
+        error_model: str = "gaiaDR2_mix",
+        epoch: float = 59800.0,
+        tno: bool = False,
+        nat_sat: bool = False,
+        sat_planet: int = 0,
+        massive_asteroid_count: int = 0,
+        massive_asteroid_file: str = " ",
+        ephem: str = "JPLDE431",
+        obs_instrument: str = "C",
+    ):
         """Constructor for OrbfitOrbitFitter
 
         Parameters:
         -----------
         work_dir: str
-          path to directory to be used for input and output of Orbfit
+          Path to directory to be used for input and output of Orbfit
+        docker_image: str, default "minorplanetcenter/orbfit:slim"
+          Name of the docker image to use, see https://hub.docker.com/r/minorplanetcenter/orbfit
+          Default tag is "latest", but that image is over 3Gb, with DE441 file along being about 2.8Gb.
+          "slim" image is much smaller
+        error_model: str, default="gaiaDR2_mix"
+          Name of the error model to use. Options seen unittests: "gaiaDR2_mix" and "comets"
+        epoch: float, default=59800.0
+          Standard epoch to be included in the config file
+        tno: bool, default=False
+          Expect the object to be a TNO. This goes into config file and likely affects sanity bounds
+          for the orbital parameters
+        nat_sat: bool, default=False
+          Is the object is a natural satellite?
+        sat_planet: int, default=0
+          If nat_sat is True, the index of the planet the object is a satellite of.
+        massive_asteroid_count: int, default = 0
+          Number of massive asteroids
+        massive_asteroid_file: str, default = " "
+          If massive_asteroid_count > 0, name of the file containing data about massive asteroids
+        ephem: str, default = "JPLDE431"
+          Ephemerides to use
+        obs_instrument: str, default="C"
+          Instrument type used to make observations, reported in MPC1992 file. "C" means CCD.
+          See https://www.minorplanetcenter.net/iau/info/OpticalObs.html
         """
         self.work_dir = work_dir
+        self.docker_image = docker_image
+        # Directory inside work_dir where input data should be placed. This goes
+        # into options file as well. The default is probably fine, so no parameter for this.
+        self._obs_dir = "mpcobs"
+        self.error_model = error_model
+        self.variants = False
+        # We are only reading eq0, not eq1, so we don't really care about the epoch anyway.
+        self.epoch = epoch
+        self.tno = tno
+        self.massive_asteroid_count = massive_asteroid_count
+        self.massive_asteroid_file = massive_asteroid_file
+        self.ephem = ephem
+        self.nat_sat = nat_sat
+        self.sat_planet = sat_planet
+        assert (
+            sat_planet > 0 or not nat_sat
+        ), "The object is marked as a natural satellite, but sat_planet is not given"
+        # There are several binaries in the image. We use only one, so treat this as a constant.
+        # If there is a desire to use other binaries (comets_od.x, fitobs.x), make sure to change
+        # options, inputs, and output files accordingly.
+        self._binary_name = "neocp_prelim.x"
+        self.obs_instrument = obs_instrument
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -71,11 +134,13 @@ class OrbfitOrbitFitter(OrbitFitter):
         object_id: str | pa.LargeStringScalar,
         observations: OrbitDeterminationObservations,
     ) -> Tuple[FittedOrbits, FittedOrbitMembers]:
+        if isinstance(object_id, pa.LargeStringScalar):
+            object_id = object_id.as_py()
         clean_id = object_id.replace(" ", "")
         path, executable = self._setup_work_dir(clean_id)
         self._post_observations(path, clean_id, observations)
         result = subprocess.run(
-            f"docker run -v {os.path.abspath(path)}:/Workspace --name orbfit --entrypoint='' --rm minorplanetcenter/orbfit:latest bash {executable}",
+            f"docker run -v '{os.path.abspath(path)}:/Workspace' --entrypoint='' --rm {self.docker_image} bash {executable}",
             shell=True,
             check=False,
         )
@@ -108,25 +173,47 @@ class OrbfitOrbitFitter(OrbitFitter):
         os.makedirs(dir, exist_ok=True)
         with open(dir / "input", "w", encoding="utf-8") as infile:
             infile.write(clean_id)
+
         # Make an output directory, otherwise Orbfit complains
-        os.makedirs(dir / "epoch", exist_ok=True)
-        # Add the correct option file
+        out_dir = dir / "epoch"
+        os.makedirs(out_dir, exist_ok=True)
+        # Wipe any existing output files
+        postfit_file = out_dir / f"{clean_id}.eq0_postfit"
+        if os.path.exists(postfit_file):
+            os.remove(postfit_file)
+
+        # Add the option file
         options = dir / "neocp.nopt"
         if not os.path.exists(options):
             with open(options, "w") as file:
-                file.write(STANDARD_OPTIONS)
+                file.write(
+                    OPTIONS.format(
+                        obsdir=self._obs_dir,
+                        error_model=self.error_model,
+                        variants=str(self.variants).upper(),
+                        epoch=self.epoch,
+                        tno=str(self.tno).upper(),
+                        nat_sat=str(self.nat_sat).upper(),
+                        planet=self.sat_planet,
+                        massive_count=self.massive_asteroid_count,
+                        massive_file=self.massive_asteroid_file,
+                        ephem=self.ephem,
+                    )
+                )
         # Create executable shell script to run inside the container
         script_path = dir / "run_this.sh"
         with open(script_path, "w") as file:
             file.write("cd /Workspace\n")
-            file.write("ln -sf /sa/god_fit/bin/neocp_prelim.x ./neocp_prelim.x\n")
-            file.write("./neocp_prelim.x < input\n")
+            file.write(
+                f"ln -sf /sa/god_fit/bin/{self._binary_name} ./{self._binary_name}\n"
+            )
+            file.write(f"./{self._binary_name} < input\n")
         return dir, "/Workspace/run_this.sh"
 
     def _post_observations(
         self, path: Path, clean_id: str, observations: OrbitDeterminationObservations
     ):
-        dir = path / "mpcobs"
+        dir = path / self._obs_dir
         os.makedirs(dir, exist_ok=True)
         # Orbfit will create this file, but if this file is already there, Orbfit is not happy
         rwo_file = dir / f"{clean_id}.rwo"
@@ -213,7 +300,7 @@ class OrbfitOrbitFitter(OrbitFitter):
         self, path: Path, clean_id: str, observations: OrbitDeterminationObservations
     ) -> Tuple[FittedOrbitMembers, List[float]]:
         """Extract fitted members and MJD dates for selected members."""
-        rwo_file = path / "mpcobs" / f"{clean_id}.rwo"
+        rwo_file = path / self._obs_dir / f"{clean_id}.rwo"
         if not rwo_file.exists():
             logger.error(f"RWO file {rwo_file} is not found")
             return FittedOrbitMembers.empty(), []
@@ -271,22 +358,36 @@ class OrbfitOrbitFitter(OrbitFitter):
         )
         return od_orbit_members, selected_times
 
-    def _degrees_to_hms(self, degrees: float) -> str:
+    @staticmethod
+    def _degrees_to_hms(degrees: float) -> str:
         """Print degrees in 'HH MM SS.ddd' format."""
-        total_hours = degrees / 15.0
+        # We printing up to 0.001 seconds. Because of the rounding in various
+        # divisions, we sometimes end up with 60 seconds instead of 1 minute.
+        # So add a bit to the degrees, then subtract the corresponding number
+        # from seconds. The subtraction can result in values on the order of
+        # -1.e-13 seconds, which print rounds to -0. Use max to avoid that.
+        eps_seconds = 0.0005
+        eps_degrees = 15 * eps_seconds / 3600
+        total_hours = (degrees + eps_degrees) / 15.0
         hours = int(total_hours)
         remaining_minutes = (total_hours - hours) * 60
         minutes = int(remaining_minutes)
-        seconds = (remaining_minutes - minutes) * 60
+        seconds = max((remaining_minutes - minutes) * 60 - eps_seconds, 0.0)
         return f"{hours:02d} {minutes:02d} {seconds:06.3f}"
 
-    def _degrees_to_dms(self, degrees: float) -> str:
+    @staticmethod
+    def _degrees_to_dms(degrees: float) -> str:
         """Print degrees in 'sDD MM SS.dd' format."""
-        sign = "+" if degrees > 0 else "-"
+        # Same epsilon trick as above to avoid "60 seconds" problem
+        eps_seconds = 0.005
+        eps_degrees = eps_seconds / 3600
+        # Debatable, is -1.0e-13 degrees or something "-00" or "+00". Choosing + here
+        sign = "+" if degrees >= -eps_degrees else "-"
+        degrees = abs(degrees) + eps_degrees
         whole_degrees = int(degrees)
         remaining_minutes = (degrees - whole_degrees) * 60
         minutes = int(remaining_minutes)
-        seconds = (remaining_minutes - minutes) * 60
+        seconds = max((remaining_minutes - minutes) * 60 - eps_seconds, 0.0)
         return f"{sign}{whole_degrees:02d} {minutes:02d} {seconds:05.2f}"
 
     def _mpc1992(
@@ -295,6 +396,18 @@ class OrbfitOrbitFitter(OrbitFitter):
         """Create string representation of observations in MPC1992 format.
 
         See https://www.minorplanetcenter.net/iau/info/OpticalObs.html
+
+        Parameters:
+        -----------
+        clean_id: str
+          whitespace-free version of the object id suitable for use in file paths
+        observations: OrbitDeterminationObservations
+          observations to encode
+
+        Returns:
+        --------
+        String representation of the observations in MPC1992 format ready to be
+        written in a .obs file.
         """
         lines = []
         for obs in observations:
@@ -307,14 +420,11 @@ class OrbfitOrbitFitter(OrbitFitter):
             # Publishable Notes For Observations Of Minor Planets and Comets
             # https://www.minorplanetcenter.net/iau/info/ObsNote.html
             publishable_note = " "
-            # How observation was made. 'C' is CCD
-            how_made = "C"
             # Date of observation
             obs_time = obs.coordinates.time.rescale("utc")
             date = obs_time.to_astropy().to_datetime()[0].strftime("%Y %m %d")
-            date += f"{obs_time.fractional_days()[0].as_py():.6f}"[
-                1:
-            ]  # "0.fraction", drop "0"
+            # "0.fraction", drop "0"
+            date += f"{obs_time.fractional_days()[0].as_py():.6f}"[1:]
             # RA, format is "HH MM SS.ddd" with 2 or 3 decimals. Assume J2000
             ra = self._degrees_to_hms(obs.coordinates.lon[0].as_py())
             # Declination is "sDD MM SS.dd" with 1 or 2 decimals. Assume J2000
@@ -332,6 +442,6 @@ class OrbfitOrbitFitter(OrbitFitter):
             # Station code
             stn = obs.observers.code[0].as_py()
 
-            line = f"{zero_padded_right_justified_number}{designation}{asterisk}{publishable_note}{how_made}{date}{ra}{decl}         {mag}{obsid}{stn}"
+            line = f"{zero_padded_right_justified_number}{designation}{asterisk}{publishable_note}{self.obs_instrument}{date}{ra}{decl}         {mag}{obsid}{stn}"
             lines.append(line)
         return "\n".join(lines)
