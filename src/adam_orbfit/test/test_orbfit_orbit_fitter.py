@@ -96,7 +96,7 @@ def test_pickle():
 def test_success(real_data):
     observations = real_data
     out_dir = tempfile.TemporaryDirectory(dir=".")
-    fitter = OrbfitOrbitFitter(work_dir=out_dir.name)
+    fitter = OrbfitOrbitFitter(work_dir=out_dir.name, timeout=1000)
     # fitter = OrbfitOrbitFitter(work_dir="test_data2") # out_dir.name)
     object_id = "2009 JY22"
     # Make sure it works with PA class as well

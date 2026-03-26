@@ -1,13 +1,14 @@
 import logging
 import os
-import subprocess
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import astropy
+import docker
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import requests
 from adam_core.coordinates import CartesianCoordinates, CoordinateCovariances, Origin
 from adam_core.coordinates.covariances import _upper_triangular_to_full
 from adam_core.orbit_determination.evaluate import (
@@ -56,7 +57,7 @@ class OrbfitOrbitFitter(OrbitFitter):
     def __init__(
         self,
         work_dir: str,
-        docker_image: str = "minorplanetcenter/orbfit:latest",
+        docker_image: str = "minorplanetcenter/orbfit:slim",
         error_model: str = "gaiaDR2_mix",
         epoch: float = 59800.0,
         tno: bool = False,
@@ -66,6 +67,14 @@ class OrbfitOrbitFitter(OrbitFitter):
         massive_asteroid_file: str = " ",
         ephem: str = "JPLDE431",
         obs_instrument: str = "C",
+        fractions: List[Tuple[float, float]] = [
+            (0.25, 1.0),
+            (0.0, 0.75),
+            (0.5, 1.0),
+            (0.25, 0.75),
+            (0.0, 0.5),
+        ],
+        timeout: Optional[float] = None,
     ):
         """Constructor for OrbfitOrbitFitter
 
@@ -87,7 +96,7 @@ class OrbfitOrbitFitter(OrbitFitter):
         nat_sat: bool, default=False
           Is the object is a natural satellite?
         sat_planet: int, default=0
-          If nat_sat is True, the index of the planet the object is a satellite of.
+          If nat_sat is True, the index of the planet the object is a satellite of
         massive_asteroid_count: int, default = 0
           Number of massive asteroids
         massive_asteroid_file: str, default = " "
@@ -97,6 +106,11 @@ class OrbfitOrbitFitter(OrbitFitter):
         obs_instrument: str, default="C"
           Instrument type used to make observations, reported in MPC1992 file. "C" means CCD.
           See https://www.minorplanetcenter.net/iau/info/OpticalObs.html
+        fractions: List[Tuple[float, float]], default=[(0.25, 1.0), (0.0, 0.75), (0.5, 1.0), (0.25, 0.75), (0.0, 0.5)]
+          List of pairs (start fraction, end fraction) of the total number of observations to try if
+          running orbfit on the complete set produces to result
+        timeout: Optional[float], default None
+          Timeout in seconds for individual docker runs
         """
         self.work_dir = work_dir
         self.docker_image = docker_image
@@ -121,6 +135,13 @@ class OrbfitOrbitFitter(OrbitFitter):
         # options, inputs, and output files accordingly.
         self._binary_name = "neocp_prelim.x"
         self.obs_instrument = obs_instrument
+        # Fractions should all be within 0-1 range, both ends allowed
+        for pair in fractions:
+            assert (
+                pair[0] >= 0.0 and pair[1] <= 1.0 and pair[0] < pair[1]
+            ), f"Fractions should be in [0,1] range with start < end. Got {pair}"
+        self.fractions = fractions
+        self.timeout = timeout
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -129,6 +150,61 @@ class OrbfitOrbitFitter(OrbitFitter):
     def __setstate__(self, state):
         self.__dict__.update(state)
 
+    def _try_initial_fit(
+        self,
+        path: Path,
+        object_id: str,
+        clean_id: str,
+        executable: str,
+        observations: OrbitDeterminationObservations,
+        start: int,
+        end: int,
+    ) -> Tuple[FittedOrbits, FittedOrbitMembers]:
+        """Inner loop function for initial_fit"""
+        logger.info(
+            f"Trying initial fit for [{start}:{end}], which is {end-start} observations out of {len(observations)}"
+        )
+        self._post_observations(path, clean_id, observations[start:end])
+        try:
+            client = docker.from_env()
+            container = client.containers.run(
+                self.docker_image,
+                f"bash {executable}",
+                stderr=True,
+                remove=True,
+                detach=True,
+                volumes=[f"{os.path.abspath(path)}:/Workspace"],
+                entrypoint="",
+            )
+            result = container.wait(timeout=self.timeout)
+            if result["StatusCode"] != 0:
+                logger.error(f"Container finished with non-0 status: {result}")
+                return FittedOrbits.empty(), FittedOrbitMembers.empty()
+        except docker.errors.DockerException as e:
+            logger.error(f"Process failed with {e}")
+            return FittedOrbits.empty(), FittedOrbitMembers.empty()
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Container timed out with {self.timeout} seconds: {e}")
+            return FittedOrbits.empty(), FittedOrbitMembers.empty()
+
+        # Extract members first, so that we can set arc length and number of observations in the fitted orbits
+        solution, selected_times = self._extract_members(
+            path, clean_id, observations[start:end]
+        )
+        if len(solution) == 0:
+            return FittedOrbits.empty(), FittedOrbitMembers.empty()
+        # Extend the solution list with appropriate number of False to match the full input list
+        solution = [False] * start + solution + [False] * (len(observations) - end)
+        members = FittedOrbitMembers.from_kwargs(
+            orbit_id=np.full(len(observations), clean_id, dtype="object"),
+            obs_id=observations.id,
+            # not setting residuals here
+            solution=solution,
+            outlier=pc.invert(solution),
+        )
+        orbits = self._extract_orbit(path, clean_id, object_id, selected_times)
+        return orbits, members
+
     def initial_fit(
         self,
         object_id: str | pa.LargeStringScalar,
@@ -136,20 +212,31 @@ class OrbfitOrbitFitter(OrbitFitter):
     ) -> Tuple[FittedOrbits, FittedOrbitMembers]:
         if isinstance(object_id, pa.LargeStringScalar):
             object_id = object_id.as_py()
-        clean_id = object_id.replace(" ", "")
+        clean_id = object_id.replace(" ", "").replace("/", "")
         path, executable = self._setup_work_dir(clean_id)
-        self._post_observations(path, clean_id, observations)
-        result = subprocess.run(
-            f"docker run -v '{os.path.abspath(path)}:/Workspace' --entrypoint='' --rm {self.docker_image} bash {executable}",
-            shell=True,
-            check=False,
+
+        # Sometimes for whatever reason orbfit throws div0 for [a, c), even thought [a, b) and [b, c)
+        # both complete successfully with similar results. Example is "2009 NA" in the benchmark set:
+        # [:490] and [490:] both work, [:] doesn't.
+        # So if the whole thing doesn't work, try smaller sections
+        total = len(observations)
+        orbits, members = self._try_initial_fit(
+            path, object_id, clean_id, executable, observations, 0, total
         )
-        if result.returncode != 0:
-            logger.error(f"Process failed with {result}")
-            return FittedOrbits.empty(), FittedOrbitMembers.empty()
-        # Extract members first, so that we can set arc length and number of observations in the fitted orbits
-        members, selected_times = self._extract_members(path, clean_id, observations)
-        orbits = self._extract_orbit(path, clean_id, object_id, selected_times)
+        idx = 0
+        while len(orbits) == 0 and idx < len(self.fractions):
+            logger.warning(f"Full set failed, trying {self.fractions[idx]} fraction")
+            orbits, members = self._try_initial_fit(
+                path,
+                object_id,
+                clean_id,
+                executable,
+                observations,
+                int(total * self.fractions[idx][0]),
+                int(total * self.fractions[idx][1]),
+            )
+            idx += 1
+
         # Fitted members would still have data even if no orbit was found, so check here
         if len(orbits) == 0:
             members = FittedOrbitMembers.empty()
@@ -298,12 +385,12 @@ class OrbfitOrbitFitter(OrbitFitter):
 
     def _extract_members(
         self, path: Path, clean_id: str, observations: OrbitDeterminationObservations
-    ) -> Tuple[FittedOrbitMembers, List[float]]:
-        """Extract fitted members and MJD dates for selected members."""
+    ) -> Tuple[List[bool], List[float]]:
+        """Extract `selected` flags for all observations and MJD dates for selected members."""
         rwo_file = path / self._obs_dir / f"{clean_id}.rwo"
         if not rwo_file.exists():
             logger.error(f"RWO file {rwo_file} is not found")
-            return FittedOrbitMembers.empty(), []
+            return [], []
         records = []
         done_header = False
         selected_times = []
@@ -321,6 +408,10 @@ class OrbfitOrbitFitter(OrbitFitter):
                     )
                     parsed = parsed.add_fractional_days(float("0." + fraction))
                     stn = line[180:183]
+                    # Pick records whose position was used in the initial fit or
+                    # least squares refinement. Not looking for the magnitude selection,
+                    # since if magnitude was used, position was as well (based on spot
+                    # checking).
                     selected = line[194:195] in ["1", "2"]
                     records.append(
                         {
@@ -332,8 +423,24 @@ class OrbfitOrbitFitter(OrbitFitter):
                     if selected:
                         selected_times.append(parsed.mjd()[0].as_py())
 
+        missing = 0
+        if len(records) != len(observations):
+            missing = len(observations) - len(records)
+            # Pretty arbitrary limit: if more than a third observations are missing, give up.
+            # Otherwise declare all missing observations rejected
+            drop_out = missing > len(observations) / 3
+            drop_str = "NOT " if drop_out else ""
+            logger.error(
+                f"Not all input observations are reflected in .rwo. Expected {len(observations)}, got {len(records)}.\n"
+                f"{missing} records are missing, so we will {drop_str}continue"
+            )
+            if drop_out:
+                return [], []
+
         solution = []
         second = 1.0 / 86400
+        # Obsid doesn't seem to make it to the rwo file, so match by date and STN.
+        # Could also check RA and DEC
         for obs in observations:
             stn = obs.observers.code[0].as_py()
             time = obs.coordinates.time.mjd()[0].as_py()
@@ -342,21 +449,23 @@ class OrbfitOrbitFitter(OrbitFitter):
                 for rec in records
                 if rec["stn"] == stn and abs(time - rec["time"]) < second
             ]
-            assert (
-                len(matches) == 1
-            ), f"No unique match for {stn}, {observations.coordinates.time.days[0]}:{observations.coordinates.time.nanos[0]} -> {matches}"
-            solution.append(matches[0]["selected"])
-
-        # Obsid doesn't seem to make it to the rwo file, so match by date and STN.
-        # Could also check RA and DEC
-        od_orbit_members = FittedOrbitMembers.from_kwargs(
-            orbit_id=np.full(len(observations), clean_id, dtype="object"),
-            obs_id=observations.id,
-            # not setting residuals here
-            solution=solution,
-            outlier=pc.invert(solution),
-        )
-        return od_orbit_members, selected_times
+            # Mark up to expected number of observations missing from .rwo as rejected.
+            # Panic if more is wrong.
+            if len(matches) == 1:
+                solution.append(matches[0]["selected"])
+            elif len(matches) == 0 and missing > 0:
+                # Allow for some known number of missing records
+                logger.warning(
+                    f"No match for {stn}, {observations.coordinates.time.days[0]}:{observations.coordinates.time.nanos[0]}, assume it was rejected"
+                )
+                solution.append(False)
+                missing -= 1
+            else:
+                logger.error(
+                    f"No unique match for {stn}, {observations.coordinates.time.days[0]}:{observations.coordinates.time.nanos[0]} -> {matches}, remaining count of missing is {missing}. Dropping out"
+                )
+                return [], []
+        return solution, selected_times
 
     @staticmethod
     def _degrees_to_hms(degrees: float) -> str:
@@ -396,6 +505,9 @@ class OrbfitOrbitFitter(OrbitFitter):
         """Create string representation of observations in MPC1992 format.
 
         See https://www.minorplanetcenter.net/iau/info/OpticalObs.html
+
+        Only some of the band colors are supported, see the above link.
+        Observations with unsupported colors are rejected (the mag part).
 
         Parameters:
         -----------
